@@ -1,0 +1,6 @@
+inherit: "config/base.yaml"
+
+# Reduce preallocated GPU storage for short runs on 8 GB GPUs.
+# This is a map capacity, not an optimization window: stop after 64 keyframes.
+keyframes:
+  buffer: 64

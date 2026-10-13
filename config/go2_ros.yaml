@@ -1,0 +1,4 @@
+inherit: "config/low_memory.yaml"
+
+# Use the D435i color camera intrinsics forwarded by the ROS 2 receiver.
+use_calib: True

@@ -1,0 +1,154 @@
+inherit: config/base.yaml
+use_calib: true
+depth_fusion:
+  enabled: true
+  min_model_conf: 2.0
+  replacement_min_conf: 4.0
+  unaligned_min_conf: 4.0
+  min_depth: 0.25
+  max_depth: 8.0
+  sensor_noise_abs: 0.04
+  sensor_noise_rel: 0.04
+  agreement_abs: 0.06
+  agreement_rel: 0.08
+  min_scale_points: 200
+  min_scale: 0.5
+  max_scale: 2.0
+  scale_log_tolerance: 0.15
+  min_scale_inlier_fraction: 0.5
+keyframes:
+  buffer: 8
+streaming:
+  candidate_cache: 2
+  search_every: 2
+dataset:
+  image_size: 640
+  center_principle_point: false
+  img_downsample: 1
+tracking:
+  sigma_depth: 0.03
+  point_selection:
+    enabled: true
+    adaptive: true
+    cell_size: 16
+    min_points: 512
+    min_valid_fraction: 0.15
+    max_pixel_error: 5.0
+    max_log_depth_error: 0.08
+    min_visible_fraction: 0.8
+    min_inlier_fraction: 0.5
+local_opt:
+  sigma_depth: 0.03
+  max_iters: 5
+realsense:
+  width: 640
+  height: 480
+  fps: 30
+  min_depth: 0.25
+  max_depth: 5.0
+  timeout_ms: 5000
+planes:
+  enabled: true
+  max_planes: 8
+
+  sample_stride: 6
+  ransac_trials: 96
+  min_points: 100
+  min_fraction: 0.04
+  distance_threshold: 0.02
+  match_angle_deg: 15.0
+  match_distance: 0.15
+  match_center_distance: 1.0
+  sigma_normal: 0.05
+  sigma_distance: 0.03
+  weight: 1.0
+  metric_scale_sigma: 0.02
+  backend_iterations: 2
+  prior_translation: 0.03
+  prior_rotation: 0.04
+  prior_scale: 0.02
+  backend_max_edges: 96
+
+# Conservative correction on large connected measured surfaces only.
+plane_depth:
+  enabled: true
+  min_area_m2: 0.25
+  min_image_fraction: 0.10
+  min_pixels: 2500
+  min_extent_m: 0.35
+  min_sensor_weight: 2.5
+  max_fit_rms_m: 0.01
+  max_plane_residual_m: 0.03
+  min_view_cos: 0.3
+  edge_threshold_m: 0.03
+  max_local_deviation_m: 0.015
+  max_coherent_residual_m: 0.01
+  boundary_margin_px: 3
+  strength: 0.60
+  max_correction_m: 0.01
+  deadband_m: 0.001
+  max_planes: 8
+
+# Raw measured plane fits, transformed by successful visual tracking poses.
+# Short CPU-only history; invalidated on backend pose revisions/tracking loss.
+temporal_plane_depth:
+  enabled: true
+  window: 8
+  min_observations: 3
+  max_tracks: 32
+  max_age_frames: 15
+  match_angle_deg: 2.0
+  match_distance_m: 0.02
+  overlap_ratio: 0.7
+  max_history_std_m: 0.008
+  max_target_difference_m: 0.015
+  strength: 0.60
+  max_correction_m: 0.003
+  deadband_m: 0.0002
+  # Heuristic variance floor, not a calibrated D457 uncertainty measurement.
+  noise_floor_m: 0.001
+  noise_depth2: 0.001
+  max_gap_s: 2.0
+  max_pose_translation_m: 0.25
+  max_pose_rotation_deg: 15.0
+
+# Disk map is separate from the SLAM keyframe cache. Full KF tensors are saved.
+temporal_surface:
+  enabled: true
+  window: 3
+  edge_threshold_m: 0.03
+  agreement_m: 0.02
+  color_threshold: 0.08
+  max_std_m: 0.008
+  strength: 0.5
+  max_correction_m: 0.004
+  deadband_m: 0.0003
+  max_gap_s: 1.0
+
+global_pose_graph:
+  enabled: true
+  max_points: 2048
+  min_points: 100
+  ransac_trials: 64
+  min_inlier_fraction: 0.6
+  inlier_distance_m: 0.04
+  max_rmse_m: 0.02
+  translation_sigma_m: 0.03
+  rotation_sigma_deg: 2.0
+  scale_sigma: 0.02
+  max_iterations: 20
+  max_nodes: 1500
+  min_interval_s: 2.0
+  max_translation_m: 0.5
+  max_rotation_deg: 10.0
+  max_log_scale: 0.05
+
+map_storage:
+  nonkeyframe_voxel_m: 0.03
+  nonkeyframe_max_points: 6000
+  nonkeyframe_min_conf: 1.5
+  # Detailed map paging is only used by the standalone saved-map viewer.
+  view_max_points: 1000000
+  view_max_chunks: 24
+  view_overview_points: 100000
+  view_refresh_s: 0.5

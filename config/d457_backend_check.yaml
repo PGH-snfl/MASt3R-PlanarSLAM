@@ -1,0 +1,6 @@
+# Integration check only: force new keyframes even with a stationary camera.
+inherit: config/d457_planar.yaml
+keyframes:
+  buffer: 8
+tracking:
+  match_frac_thresh: 1.01
