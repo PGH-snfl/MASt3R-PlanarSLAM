@@ -19,27 +19,64 @@ from mast3r_slam.remote_archive import MARKER
 
 # Only protocol bytes go to stdout once sshfs starts. Diagnostics go to stderr.
 REMOTE_SETUP = r'''
-import os, pathlib, shutil, sys
+import os, pathlib, re, shutil, subprocess, sys, time
 local, mount = sys.argv[1:]
-mount = pathlib.Path(mount).expanduser().absolute()
+mount = pathlib.Path(os.path.abspath(os.path.expanduser(mount)))
+print('SSH authenticated. Checking archive mount without accessing its files...', file=sys.stderr, flush=True)
+def mounted_paths():
+    # stat()/ismount() can hang forever on an abandoned SSHFS connection.
+    return {re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), line.split()[4])
+            for line in pathlib.Path('/proc/self/mountinfo').read_text().splitlines()}
+if str(mount) in mounted_paths():
+    sys.exit('Archive mount already exists at ' + str(mount) +
+             '. Stop SLAM first; for a stale mount run: fusermount3 -u -z ' + str(mount))
 if not shutil.which('sshfs'):
     sys.exit('Server needs sshfs: sudo apt install sshfs')
 if not os.path.exists('/dev/fuse'):
     sys.exit('Server /dev/fuse is unavailable; enable FUSE before mounting')
-if os.path.ismount(mount):
-    sys.exit('Archive mount already exists. Stop its SLAM before unmounting/replacing it.')
 mount.mkdir(parents=True, exist_ok=True)
 if any(mount.iterdir()):
     sys.exit('Refusing to hide files: mount directory must be empty')
 print('Mounting laptop archive at ' + str(mount), file=sys.stderr, flush=True)
-os.execvp('sshfs', ['sshfs', '-f', '-o', 'passive,idmap=user,dir_cache=no,cache=no', ':' + local, str(mount)])
+child = subprocess.Popen(['sshfs', '-f', '-o', 'passive,idmap=user,dir_cache=no,cache=no', ':' + local, str(mount)])
+probe = """
+import json, pathlib, sys, tempfile
+root = pathlib.Path(sys.argv[1])
+assert json.loads((root/'.mast3r-laptop-archive.json').read_text())['format'] == 'mast3r-laptop-archive-v1'
+with tempfile.TemporaryFile(dir=root) as f:
+    f.write(b'mast3r archive connection check'); f.flush(); f.seek(0)
+    assert f.read() == b'mast3r archive connection check'
+"""
+try:
+    deadline = time.monotonic() + 15
+    while str(mount) not in mounted_paths():
+        if child.poll() is not None:
+            sys.exit('SSHFS exited before mounting: ' + str(child.returncode))
+        if time.monotonic() > deadline:
+            sys.exit('SSHFS mount timed out after 15 seconds')
+        time.sleep(.1)
+    try:
+        subprocess.run([sys.executable, '-c', probe, str(mount)], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, check=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        sys.exit('Archive read/write timed out. Stop SLAM and detach the stale mount with fusermount3 -u -z ' + str(mount))
+    print('ARCHIVE READY: laptop read/write verified. Keep this terminal open.', file=sys.stderr, flush=True)
+    sys.exit(child.wait())
+finally:
+    if child.poll() is None:
+        child.terminate()
+        try:
+            child.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
 '''
 
 
 def ssh_command(args, local_dir):
     # No shell on the laptop; quote the complete remote command for SSH's shell.
     remote = shlex.join(['python3', '-c', REMOTE_SETUP, str(local_dir), args.server_mount])
-    command = ['ssh', '-T', '-p', str(args.ssh_port), '-o', 'ServerAliveInterval=15',
+    command = ['ssh', '-T', '-p', str(args.ssh_port), '-o', 'ConnectTimeout=10', '-o', 'ServerAliveInterval=15',
                '-o', 'ServerAliveCountMax=3']
     if args.identity:
         command += ['-i', os.path.expanduser(args.identity)]

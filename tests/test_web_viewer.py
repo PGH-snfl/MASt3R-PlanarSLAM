@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from mast3r_slam.web_visualization import frame_cloud, map_cloud, sample_indices
 from mast3r_slam.remote_archive import require_archive_mount, sshfs_mounts
-from mount_laptop_maps import ssh_command
+from mount_laptop_maps import ssh_command, REMOTE_SETUP
 
 
 class Pose:
@@ -49,6 +49,14 @@ class Tests(unittest.TestCase):
     def test_mountinfo_escaped_paths(self):
         info = '42 10 0:50 / /tmp/laptop\\040maps rw - fuse.sshfs :/tmp/maps rw\n'
         self.assertEqual(sshfs_mounts(info), {'/tmp/laptop maps'})
+
+    def test_stale_mount_rejected_without_stat(self):
+        info = '42 10 0:50 / /tmp/stale\\040maps rw - fuse.sshfs :/tmp/maps rw\n'
+        with patch.object(sys, 'argv', ['remote', '/tmp/source', '/tmp/stale maps']), \
+             patch.object(Path, 'read_text', return_value=info), \
+             patch.object(Path, 'stat', side_effect=AssertionError('Must not stat stalled FUSE')):
+            with self.assertRaisesRegex(SystemExit, 'Archive mount already exists'):
+                exec(REMOTE_SETUP, {})
 
     def test_ssh_command_quotes_paths(self):
         import shlex

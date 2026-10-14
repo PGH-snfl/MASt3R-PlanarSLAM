@@ -58,6 +58,11 @@ SSH 포트가 22가 아니면 `--ssh-port 포트번호`를 추가합니다. 필�
 지정하거나 `--server`에 SSH config 별칭을 사용합니다. SSH 비밀번호 입력이 가능합니다.
 마운트 경로에 파일이나 기존 마운트가 있으면 덮어쓰지 않고 중단합니다.
 **이 터미널은 SLAM을 종료하고 저장 완료를 확인할 때까지 유지합니다.**
+정상 연결 시 `ARCHIVE READY: laptop read/write verified`가 출력됩니다.
+`mountpoint`도 멈추는 경우 기존 SSHFS 마운트가 응답하지 않을 수 있습니다. 서버에서
+SLAM을 먼저 중지하고 `fusermount3 -u -z "$HOME/laptop-maps"`로 기존 마운트를 해제한 뒤
+노트북의 연결 프로그램을 다시 실행합니다. 연결 프로그램은 기존 마운트 여부를
+`/proc/self/mountinfo`로 검사하므로 끊긴 마운트에 `stat()` 요청을 보내며 무한 대기하지 않습니다.
 
 구현은 OpenSSH SFTP와 [SSHFS의 passive 모드](https://github.com/libfuse/sshfs/blob/master/sshfs.rst)를
 사용합니다. 노트북에서 시작한 SSH 연결을 거꾸로 파일 연결에 사용하므로 서버가 노트북에
