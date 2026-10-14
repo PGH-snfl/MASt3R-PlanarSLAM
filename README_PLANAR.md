@@ -1,5 +1,8 @@
 # MASt3R + 평면 제약 + USB RealSense
 
+원격 서버 연산·노트북 브라우저 화면·노트북 실시간 저장은
+[공인 IP SSH 실행 안내](README_REMOTE_LIVE.md)를 참고하세요 (`--web-viz`, `--archive-mount`).
+
 `/home/cvr/GH/mast3r/MASt3R-SLAM`을 별도 폴더로 복사한 실험 프로젝트입니다. 원본 코드와 기존 conda 환경의 editable 설치 경로는 변경하지 않았습니다. 복사된 MASt3R 소스와 체크포인트, 기존 `mast3r-slam` 환경의 CUDA 확장 라이브러리를 사용합니다.
 
 ## 실행

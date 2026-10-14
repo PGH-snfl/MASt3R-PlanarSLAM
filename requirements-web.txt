@@ -1,0 +1,3 @@
+# Optional browser viewer. Does not replace PyTorch or CUDA packages.
+viser==1.1.1
+numpy==1.26.4

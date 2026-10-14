@@ -1,4 +1,4 @@
-"""Live D457 RGB-D + plane-constrained MASt3R, using the original viewer."""
+"""Live RGB-D + plane-constrained MASt3R with desktop or browser viewing."""
 import argparse
 import json
 import os
@@ -12,7 +12,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/d457_planar.yaml")
     parser.add_argument("--serial")
-    parser.add_argument("--camera-host", help="Camera computer's Tailscale IP; use network RGB-D instead of local USB")
+    parser.add_argument("--camera-host", help="Camera host or SSH tunnel address; use network RGB-D instead of local USB")
     parser.add_argument("--camera-port", type=int, default=9877)
     parser.add_argument("--camera-timeout", type=float, default=10., help="Network transfer deadline in seconds")
     parser.add_argument("--image-size", type=int, choices=(512, 640),
@@ -22,6 +22,11 @@ def main():
     parser.add_argument("--list-devices", action="store_true")
     parser.add_argument("--check-camera", action="store_true", help="Check 30 RGB-D frames without loading the model")
     parser.add_argument("--no-viz", action="store_true")
+    parser.add_argument("--web-viz", action="store_true", help="Browser viewer over SSH; replaces the desktop/OpenGL window")
+    parser.add_argument("--web-port", type=int, default=8080)
+    parser.add_argument("--web-fps", type=float, default=2., help="Browser update limit; independent of SLAM FPS")
+    parser.add_argument("--web-points", type=int, default=50000, help="Browser overview point budget, plus up to 4000 current points")
+    parser.add_argument("--archive-mount", help="Require a mounted laptop archive folder; create a new session inside it")
     parser.add_argument("--max-frames", type=int, default=0, help="0: run until the window closes or Ctrl+C")
     parser.add_argument("--fps", type=float, default=5., help="Maximum processing rate; camera captures at its configured FPS")
     parser.add_argument("--disable-planes", action="store_true", help="Disable plane pose constraints and plane depth denoising")
@@ -36,6 +41,14 @@ def main():
     parser.add_argument("--viewer-fps", type=float, default=5., help="Maximum live data publication rate; latest frame only")
     args = parser.parse_args()
     import math
+    native_viz = not args.no_viz and not args.web_viz
+    if not 1 <= args.web_port <= 65535 or not math.isfinite(args.web_fps) or args.web_fps <= 0 or args.web_points < 100:
+        parser.error('Invalid web port, FPS or point budget')
+    if args.archive_mount and args.archive_dir:
+        parser.error('Choose --archive-mount or --archive-dir')
+    if args.archive_mount:
+        from mast3r_slam.remote_archive import require_archive_mount
+        args.archive_mount = str(require_archive_mount(args.archive_mount))
     if not 1 <= args.camera_port <= 65535 or not math.isfinite(args.camera_timeout) or args.camera_timeout <= 0:
         parser.error('Invalid camera port or timeout')
     if args.camera_host and (args.serial or args.list_devices):
@@ -112,16 +125,20 @@ def main():
     from mast3r_slam.temporal_surface import TemporalSurfaceDepth
     from mast3r_slam.disk_map import DiskMapWriter
     from mast3r_slam.multiprocess_utils import new_queue, try_get_msg
-    from mast3r_slam.visualization import run_visualization
+    if native_viz:
+        from mast3r_slam.visualization import run_visualization
     from mast3r_slam.runtime_metrics import StageTimer, DisplayGate
     display = DisplayGate(args.viewer_fps)
     metrics_file = None
     device = "cuda:0"
     mp.set_start_method("spawn", force=True)
-    manager, states, viz = None, None, None
+    manager, states, viz, web = None, None, None, None
     backend, keyframes, disk_map = None, None, None
     processed, tracked, plane_count = 0, 0, 0
     try:
+        if args.web_viz:
+            from mast3r_slam.web_visualization import WebViewer
+            web = WebViewer(args.web_port, args.web_fps, args.web_points)
         h, w = dataset.get_img_shape()[0]
         model = load_mast3r(device=device).eval()
         if not args.no_sdpa:
@@ -133,7 +150,8 @@ def main():
         if recent < 2:
             parser.error('--recent-keyframes must be at least 2')
         from datetime import datetime
-        archive_dir = args.archive_dir or str(ROOT / 'maps' / datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
+        archive_root = Path(args.archive_mount) if args.archive_mount else ROOT / 'maps'
+        archive_dir = args.archive_dir or str(archive_root / datetime.now().strftime('%Y%m%d_%H%M%S_%f'))
         keyframes = KeyframeArchive(archive_dir, recent=recent,
                                    cache=config.get('streaming', {}).get('candidate_cache', 2), device=device,
                                    preview_limit=150000, save_on_append=True)
@@ -142,16 +160,17 @@ def main():
         metrics_file = (Path(archive_dir)/'performance.jsonl').open('w', buffering=1)
         import yaml
         (Path(archive_dir)/'config.yaml').write_text(yaml.safe_dump(config))
-        view_keyframes = SharedKeyframes(manager, h, w, buffer=recent, device='cpu')
-        view_keyframes.set_intrinsics(K.cpu())
-        # Live display stays in memory. Disk paging is reserved for the
-        # standalone saved-map viewer; full map persistence continues below.
-        view_keyframes.history = torch.zeros(keyframes.preview_limit, 6).share_memory_()
-        view_keyframes.history_count = manager.Value('i', 0)
-        view_keyframes.history_revision = manager.Value('i', -1)
+        view_keyframes = None
+        if native_viz:
+            view_keyframes = SharedKeyframes(manager, h, w, buffer=recent, device='cpu')
+            view_keyframes.set_intrinsics(K.cpu())
+            # Native display stays in memory; detailed disk paging is offline.
+            view_keyframes.history = torch.zeros(keyframes.preview_limit, 6).share_memory_()
+            view_keyframes.history_count = manager.Value('i', 0)
+            view_keyframes.history_revision = manager.Value('i', -1)
         states = SharedStates(manager, h, w, device='cpu')
-        main2viz = new_queue(manager, args.no_viz)
-        viz2main = new_queue(manager, args.no_viz)
+        main2viz = new_queue(manager, not native_viz)
+        viz2main = new_queue(manager, not native_viz)
         tracker = FrameTracker(model, keyframes, device)
         backend = StreamingBackend(model, keyframes, K, retrieval, device)
         temporal_depth = TemporalPlaneDepth(config.get('temporal_plane_depth', {}))
@@ -162,9 +181,14 @@ def main():
         last_pose = lietorch.Sim3.Identity(1, device=device)
         print(f"Ready: recent GPU keyframes={recent}, candidate cache={keyframes.cache_limit}. "
               f"Keyframes/map archive: {archive_dir} (continuous video is not recorded)", flush=True)
-        print("Live viewer: recent keyframes + 150,000-point overview; disk detail loading only in view_saved_map.sh", flush=True)
+        if args.archive_mount:
+            print('Archive destination: laptop via SSHFS; keep mount_laptop_maps.py running until Saved map.', flush=True)
+        if native_viz:
+            print("Live viewer: recent keyframes + 150,000-point overview; disk detail loading only in view_saved_map.sh", flush=True)
         while not args.max_frames or processed < args.max_frames:
             started = time.monotonic()
+            if args.archive_mount:
+                require_archive_mount(args.archive_mount, check_marker=False)
             if viz is not None and not viz.is_alive():
                 if viz.exitcode != 0:
                     raise RuntimeError(f"Viewer failed with exit code {viz.exitcode}")
@@ -256,7 +280,7 @@ def main():
             view_ready, view_changed = display.ready(time.monotonic(),
                 len(keyframes) != previous_count or backend.last_verified != previous_loop
                 or keyframes.pose_revision != previous_revision)
-            if not args.no_viz and view_ready and view_changed:
+            if native_viz and view_ready and view_changed:
                 with timer.measure('viewer_keyframes'):
                     backend.publish(view_keyframes, states)
             if not torch.isfinite(frame.T_WC.data).all():
@@ -269,11 +293,14 @@ def main():
                     keyframe_id = anchor_id if anchor.frame_id == frame.frame_id else None
                     disk_map.add_frame(frame, anchor_id, anchor.T_WC.matrix().detach().cpu().numpy(),
                                        timestamp, keyframe_id)
-            if not args.no_viz and view_ready:
+            if native_viz and view_ready:
                 with timer.measure('viewer_frame'):
                     states.set_frame(frame, include_features=False)
             last_pose = lietorch.Sim3(frame.T_WC.data.clone())
-            if viz is None and not args.no_viz:
+            if web is not None and web.ready():
+                with timer.measure('viewer_web'):
+                    web.publish(frame, keyframes, states.get_mode().name)
+            if viz is None and native_viz:
                 ready = mp.Event()
                 viz = mp.Process(target=run_visualization, args=(config, states, view_keyframes, main2viz, viz2main, ready))
                 viz.start()
@@ -331,6 +358,11 @@ def main():
         print("Stopped by user")
     finally:
         dataset.close()
+        if web is not None:
+            try:
+                web.close()
+            except Exception as exc:
+                print(f'Browser shutdown error: {exc}; continuing map cleanup', flush=True)
         if states is not None:
             states.set_mode(Mode.TERMINATED)
         if viz is not None:

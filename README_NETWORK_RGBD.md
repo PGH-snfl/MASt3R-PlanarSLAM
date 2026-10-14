@@ -1,8 +1,9 @@
 # RealSense RGB-D를 다른 GPU 서버에서 처리하기
 
 카메라가 연결된 PC는 RGB·깊이를 수집하고, A6000 서버는 기존 MASt3R-PlanarSLAM
-추론·깊이 보정·평면 처리·맵 저장을 수행합니다. 이 기능은 카메라 입력 전송입니다.
-SLAM의 기존 3D 뷰어는 서버에서 실행되므로 여기서 보려면 별도 원격 데스크톱이 필요합니다.
+추론·깊이 보정·평면 처리를 수행합니다. 아래는 사설망/Tailscale에서의 카메라 입력 설정입니다.
+**노트북에 Tailscale 없이 공인 IP SSH를 사용하고, 실시간 화면과 맵 저장을 노트북에서
+진행하려면 [서버 연산 + 노트북 화면·저장 안내](README_REMOTE_LIVE.md)를 따르세요.**
 
 ## 1. 카메라 PC에서 송신기 실행
 
@@ -53,7 +54,7 @@ GPU에 맞게 빌드합니다. 로컬 Conda 환경이나 컴파일된 `.so`를 �
 python run_d457.py --camera-host <카메라_PC_IP> --image-size 640 --fps 5
 ```
 
-SSH 터미널만 있고 서버의 그래픽 세션이 준비되지 않았다면:
+SSH 터미널에서 화면이 필요 없다면:
 
 ```bash
 python run_d457.py --camera-host <카메라_PC_IP> --image-size 640 --fps 5 --no-viz
@@ -61,6 +62,7 @@ python run_d457.py --camera-host <카메라_PC_IP> --image-size 640 --fps 5 --no
 
 `--no-viz`는 화면만 끄고 기존 맵 저장을 계속합니다. 맵은 **서버 프로젝트의 `maps/`**에
 저장됩니다. `--archive-dir`로 새 세션 디렉터리를 지정할 수 있습니다.
+브라우저 화면은 `--web-viz`, 노트북 저장은 `--archive-mount`를 사용합니다.
 모델 없이 SLAM 입력 형상까지 확인하려면 `--check-camera`를 추가합니다.
 연결 정보는 `--camera-port 9877`, `--camera-timeout 10`으로 조절합니다.
 `--camera-host`를 생략하면 기존 USB 직접 입력 방식으로 실행됩니다.

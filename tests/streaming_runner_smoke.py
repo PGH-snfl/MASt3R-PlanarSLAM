@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import json
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -60,10 +61,18 @@ class Database:
 
 
 def main():
+    web_mode = '--web' in sys.argv
     with tempfile.TemporaryDirectory(prefix='mast3r-runner-test-') as temp:
         archive = Path(temp)/'session'
         sys.argv = ['run_d457.py', '--no-viz', '--max-frames', '16', '--fps', '30',
                     '--archive-dir', str(archive), '--recent-keyframes', '3', '--image-size', '512']
+        if web_mode:
+            sys.argv.remove('--no-viz')
+            sys.argv += ['--web-viz', '--web-port', '18081', '--web-points', '1000']
+        mount = os.environ.get('MAST3R_TEST_MOUNT')
+        if mount:
+            arg_idx = sys.argv.index('--archive-dir')
+            sys.argv[arg_idx:arg_idx+2] = ['--archive-mount', mount]
         overview_counts = []
         original_publish = StreamingBackend.publish
         def check_live_publish(backend, view, states):
@@ -80,12 +89,16 @@ def main():
              patch('mast3r_slam.tracker.FrameTracker', Tracker), \
              patch('mast3r_slam.efficient_attention.enable_efficient_attention', return_value=0), \
              patch.object(StreamingBackend, 'publish', check_live_publish), \
+             patch('mast3r_slam.web_visualization.WebViewer.ready', return_value=True), \
              patch('mast3r_slam.global_opt.FactorGraph.add_factors', return_value=False):
             run_d457.main()
+        if mount:
+            archive, = [p for p in Path(mount).iterdir() if p.is_dir()]
         assert not overview_counts, 'Headless tracking must skip all viewer publication'
         metrics = [json.loads(line) for line in (archive/'performance.jsonl').read_text().splitlines()]
         assert len(metrics) == 16
         assert all('viewer_frame' not in m['stages_ms'] for m in metrics)
+        assert all(('viewer_web' in m['stages_ms']) == web_mode for m in metrics)
         assert all(m['map_pending'] <= 2 for m in metrics)
         manifest = json.loads((archive/'manifest.json').read_text())
         assert manifest['keyframes'] > 3, manifest
