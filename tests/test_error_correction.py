@@ -150,6 +150,28 @@ class GlobalGraphTests(unittest.TestCase):
         self.assertFalse(stats['accepted'])
         np.testing.assert_array_equal(rejected,poses)
 
+    def test_offline_settle_applies_pending_pose_before_archive_close(self):
+        from test_keyframe_archive import frame
+        with tempfile.TemporaryDirectory() as d:
+            store = KeyframeArchive(Path(d)/'map', recent=2, device='cpu')
+            graph = GlobalPoseGraph(store, dict(enabled=True))
+            try:
+                store.append(frame(0))
+                store.append(frame(1))
+                v = np.array([p.numpy() for p in store.poses]).reshape(-1, 8)
+                v[1, 0] += .01
+                graph.snapshot = (len(store), store.pose_revision)
+                graph.pending = Future()
+                graph.pending.set_result((matrices(v), dict(accepted=True)))
+                graph.next_solve = time.monotonic() + 1000
+                graph.settle()
+                self.assertIsNone(graph.pending)
+                self.assertEqual(graph.stats['status'], 'applied')
+                self.assertAlmostEqual(float(store.poses[1][0, 0]), .11, places=5)
+            finally:
+                graph.close()
+                store.close()
+
     def test_global_archived_pose_preview_and_stale_worker(self):
         from test_keyframe_archive import frame
         with tempfile.TemporaryDirectory() as d:

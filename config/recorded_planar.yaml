@@ -1,0 +1,18 @@
+# Offline quality profile. Keep memory budgets and geometric rejection gates.
+inherit: config/d457_planar.yaml
+tracking:
+  point_selection:
+    enabled: false
+local_opt:
+  max_iters: 10
+streaming:
+  search_every: 1
+planes:
+  sample_stride: 4
+  ransac_trials: 192
+  backend_iterations: 4
+global_pose_graph:
+  max_points: 4096
+  ransac_trials: 128
+  max_iterations: 40
+  min_interval_s: 0.0

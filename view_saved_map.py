@@ -24,12 +24,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('session', nargs='?', help='Session directory, default latest maps/ session')
     parser.add_argument('--inspect', action='store_true', help='Print stored map counts without opening a window')
+    parser.add_argument('--render-mode', choices=('points', 'surfels'), default='points',
+                        help='surfels: original shader on full keyframes plus auxiliary point cloud')
+    parser.add_argument('--surfel-keyframes', type=int, default=12, help='Maximum full keyframes resident in the surfel viewer')
+    parser.add_argument('--start-view', choices=('first', 'last'), default='first',
+                        help='Initial saved camera viewpoint (default: first)')
     args = parser.parse_args()
+    if not 1 <= args.surfel_keyframes <= 64:
+        parser.error('--surfel-keyframes must be between 1 and 64')
     session = resolve_session(args.session)
     os.chdir(ROOT)
     from mast3r_slam.disk_map import DiskMapReader
     from mast3r_slam.config import config, load_config
     load_config(str(session/'config.yaml') if (session/'config.yaml').is_file() else 'config/d457_planar.yaml')
+    config.setdefault('map_storage', {}).update(view_render_mode=args.render_mode,
+                                              view_surfel_keyframes=args.surfel_keyframes)
     reader = DiskMapReader(session, config.get('map_storage', {}))
     try:
         reader.refresh()
@@ -52,7 +61,7 @@ def main():
     from mast3r_slam.keyframe_archive import unpack_frame
     from mast3r_slam.frame import SharedStates, SharedKeyframes, Mode
     from mast3r_slam.visualization import run_visualization
-    entry = keyframes[-1]
+    entry = keyframes[0] if args.start_view == 'first' else keyframes[-1]
     payload = torch.load(session/'keyframes'/f"{entry['keyframe_id']:08d}.pt", map_location='cpu', weights_only=True)
     frame = unpack_frame(payload, 'cpu')
     # The .pt pose may predate a graph correction; the disk map pose table wins.
@@ -71,6 +80,7 @@ def main():
         states.set_frame(frame)
         states.set_mode(Mode.TRACKING)
         print(f'Viewing saved map: {session}', flush=True)
+        print(f"Starting at saved keyframe {entry['keyframe_id']}; use Reset saved view if the map leaves the screen.", flush=True)
         run_visualization(config, states, view, manager.Queue(), manager.Queue())
 
 

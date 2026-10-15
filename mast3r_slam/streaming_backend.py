@@ -71,6 +71,7 @@ class TemporaryFrames:
 class StreamingBackend:
     def __init__(self, model, store, K, retrieval, device):
         self.model, self.store, self.K, self.device = model, store, K, device
+        self.offline = config.get('streaming', {}).get('offline', False)
         self.graph = FactorGraph(model, store, K, device)
         self.search = AsyncRetrieval(retrieval)
         self.candidates = deque()
@@ -119,23 +120,37 @@ class StreamingBackend:
                 self.unindexed.popleft()
 
     def tick(self, frame, relocating=False):
-        """Verify at most one candidate per input frame; disk loads never wait."""
+        """Live: one ready candidate. Offline: wait and verify all retrieved candidates."""
         self.global_graph.poll()
+        if self.offline:
+            self._submit_index()
+            if relocating and not self.reloc_pending and not self.candidates:
+                self.reloc_pending = self.search.submit(frame, None, False)
+            for future in self.search.pending:
+                future.result()  # Backpressure: finish retrieval before advancing input.
         for tag, added, candidates in self.search.poll():
             if not added:
                 self.reloc_pending = False
             relevant = (not added and relocating) or (added and not relocating and
                         tag in self.store.recent and tag % self.search_interval == 0)
             if relevant and not self.candidates:
-                # No accumulating work queue. Two selected old frames at most.
+                # Offline candidates are loaded sequentially within the same cache.
                 chosen = [i for i in candidates if not added or i < tag-1]
-                for idx in chosen[:self.store.cache_limit]:
+                for idx in (chosen if self.offline else chosen[:self.store.cache_limit]):
                     self.candidates.append((None if not added else tag, idx))
                     self.store.prefetch(idx)
         self._submit_index()
-        if relocating and not self.reloc_pending and not self.candidates and self.search.ready() and time.monotonic() >= self.next_reloc:
+        if not self.offline and relocating and not self.reloc_pending and not self.candidates and self.search.ready() and time.monotonic() >= self.next_reloc:
             self.reloc_pending = self.search.submit(frame, None, False)
             self.next_reloc = time.monotonic() + 1.0
+        if self.offline:
+            while self.candidates:
+                if self._verify_next(frame, relocating):
+                    return True
+            return False
+        return self._verify_next(frame, relocating)
+
+    def _verify_next(self, frame, relocating):
         if not self.candidates:
             return False
         query, candidate = self.candidates[0]
@@ -144,7 +159,13 @@ class StreamingBackend:
             if not self.candidates:
                 self.store.discard_prefetches()
             return False
-        if not self.store.prefetch(candidate) or not self.store.poll(candidate):
+        if not self.store.prefetch(candidate):
+            if self.offline:
+                raise RuntimeError('Offline candidate cache cannot schedule a load')
+            return False
+        if self.offline and candidate in self.store.loads:
+            self.store.loads[candidate].result()
+        if not self.store.poll(candidate):
             return False
         self.candidates.popleft()
         self._prune(candidate)

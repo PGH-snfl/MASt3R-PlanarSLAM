@@ -242,6 +242,17 @@ class GlobalPoseGraph:
         self.next_solve = time.monotonic()+self.cfg.get('min_interval_s', 2.)
         self.dirty = False
 
+    def settle(self):
+        """Apply pending work and solve the latest dirty snapshot before proceeding."""
+        if self.pending is not None:
+            self.pending.result()
+            self.poll()
+        self.next_solve = 0.
+        self.submit()
+        if self.pending is not None:
+            self.pending.result()
+            self.poll()
+
     def close(self):
         if self.worker is not None:
             # Shutdown must not mutate poses after the disk map's final sync.

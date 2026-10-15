@@ -106,12 +106,29 @@ class Window(WindowEvents):
         self.disk_map_count = 0
         self.disk_map_stats = {}
         self.disk_map_next = 0.
+        self.disk_surfel_textures = {}
+        self.disk_surfels = []
         if getattr(keyframes, 'map_view_only', False) and hasattr(keyframes, 'map_directory'):
             from mast3r_slam.disk_map import DiskMapReader
-            self.disk_map = DiskMapReader(keyframes.map_directory, config.get('map_storage', {}))
+            reader_cls = DiskMapReader
+            if config.get('map_storage', {}).get('view_render_mode') == 'surfels':
+                from mast3r_slam.surfel_map import SurfelMapReader
+                reader_cls = SurfelMapReader
+            self.disk_map = reader_cls(keyframes.map_directory, config.get('map_storage', {}))
         if getattr(keyframes, 'map_view_only', False):
             self.show_curr_pointmap = False
             self.show_features = False
+            self.reset_saved_view()
+
+    def reset_saved_view(self):
+        """Start at the recorded camera, not two metres behind it inside a wall."""
+        pose = as_SE3(self.states.get_frame().T_WC).cpu().matrix().numpy().reshape(4, 4)
+        self.camera.unfollow_cam()
+        self.camera.follow_cam(np.linalg.inv(pose))
+        self.camera.unfollow_cam()
+        self.follow_cam = False
+        self.show_all = True
+        self.disk_map_next = 0.
 
     def render(self, t: float, frametime: float):
         # The live window may replace CPU slots while this process renders.
@@ -123,6 +140,8 @@ class Window(WindowEvents):
         self.ctx.enable(moderngl.DEPTH_TEST)
         if self.culling:
             self.ctx.enable(moderngl.CULL_FACE)
+        else:
+            self.ctx.disable(moderngl.CULL_FACE)
         self.ctx.clear(*self.clear)
 
         self.ctx.point_size = 2
@@ -138,9 +157,10 @@ class Window(WindowEvents):
 
         cam_T_WC = as_SE3(curr_frame.T_WC).cpu()
         if self.follow_cam:
+            offset = 0. if getattr(self.keyframes, 'map_view_only', False) else -2.
             T_WC = cam_T_WC.matrix().numpy().astype(
                 dtype=np.float32
-            ) @ translation_matrix(np.array([0, 0, -2], dtype=np.float32))
+            ) @ translation_matrix(np.array([0, 0, offset], dtype=np.float32))
             self.camera.follow_cam(np.linalg.inv(T_WC))
         else:
             self.camera.unfollow_cam()
@@ -286,8 +306,15 @@ class Window(WindowEvents):
         _, self.follow_cam = imgui.checkbox("follow cam", self.follow_cam)
         if self.disk_map is not None:
             s = self.disk_map_stats
+            if imgui.button('Reset saved view'):
+                self.reset_saved_view()
+            if not s:
+                imgui.text('Loading saved geometry...')
             imgui.text(f"Saved map: {s.get('keyframes', 0)} keyframes / {s.get('nonkeyframes', 0)} other frames")
             imgui.text(f"Detailed points: {s.get('detailed_points', 0):,} / overview: {s.get('overview_points', 0):,}")
+            if config.get('map_storage', {}).get('view_render_mode') == 'surfels':
+                imgui.text(f"Surfel keyframes: {s.get('surfel_keyframes', 0)} / {self.disk_map.surfel_limit}")
+                imgui.text(f"Surfel samples: {s.get('surfel_points', 0):,}")
             imgui.text("Uncheck follow cam to explore saved regions")
 
         imgui.spacing()
@@ -379,7 +406,24 @@ class Window(WindowEvents):
     def render_disk_map(self):
         result = self.disk_map.poll()
         if result is not None:
+            first_load = not self.disk_map_stats
             points, self.disk_map_stats = result
+            if first_load:
+                print(f"Saved map loaded: {self.disk_map_stats.get('surfel_keyframes', 0)} surfel keyframes, "
+                      f"{len(points):,} auxiliary/display points", flush=True)
+            self.disk_surfels = self.disk_map_stats.pop('surfels', [])
+            alive = {s['frame_id'] for s in self.disk_surfels}
+            for fid in list(self.disk_surfel_textures):
+                if fid not in alive:
+                    for texture in self.disk_surfel_textures.pop(fid):
+                        texture.release()
+            for surface in self.disk_surfels:
+                fid = surface['frame_id']
+                if fid not in self.disk_surfel_textures:
+                    h, w = surface['shape']
+                    self.disk_surfel_textures[fid] = tuple(
+                        self.ctx.texture((w, h), channels, data=surface[name].tobytes(), dtype='f4', alignment=4)
+                        for name, channels in [('xyz', 3), ('confidence', 1), ('rgb', 3)])
             if not hasattr(self, 'disk_map_buffer'):
                 budget = self.disk_map.point_budget+int(self.disk_map.cfg.get('view_overview_points', 100000))
                 self.disk_map_buffer = self.ctx.buffer(reserve=max(1, budget)*24, dynamic=True)
@@ -402,6 +446,10 @@ class Window(WindowEvents):
             self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
             self.disk_map_vao.render(mode=moderngl.POINTS, vertices=self.disk_map_count)
             self.ctx.disable(moderngl.PROGRAM_POINT_SIZE)
+        for surface in self.disk_surfels:
+            h, w = surface['shape']
+            self.render_pointmap(None, w, h, *self.disk_surfel_textures[surface['frame_id']],
+                                 model_matrix=surface['matrix'])
 
     def render_history(self):
         count = self.keyframes.history_count.value
@@ -436,12 +484,13 @@ class Window(WindowEvents):
             print(f"Tracking feature overlay rendered: {self.feature_count} points", flush=True)
             self.feature_reported = True
 
-    def render_pointmap(self, T_WC, w, h, ptex, ctex, itex, use_img=True, depth_bias=0):
+    def render_pointmap(self, T_WC, w, h, ptex, ctex, itex, use_img=True, depth_bias=0, model_matrix=None):
         w, h = int(w), int(h)
         ptex.use(0)
         ctex.use(1)
         itex.use(2)
-        model = T_WC.matrix().numpy().astype(np.float32).T
+        model = np.ascontiguousarray(
+            (T_WC.matrix().numpy() if model_matrix is None else model_matrix).astype(np.float32).T)
 
         vao = self.ctx.vertex_array(self.pointmap_prog, [], skip_errors=True)
         vao.program["m_camera"].write(self.camera.gl_matrix())
@@ -550,6 +599,9 @@ def run_visualization(cfg, states, keyframes, main2viz, viz2main, ready_event=No
     state = window_config.state
     if window_config.disk_map is not None:
         window_config.disk_map.close()
+    for textures in window_config.disk_surfel_textures.values():
+        for texture in textures:
+            texture.release()
     window.destroy()
     state.is_terminated = True
     viz2main.put(state)

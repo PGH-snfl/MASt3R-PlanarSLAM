@@ -37,7 +37,7 @@ class RealSenseRGBDDataset(MonocularDataset):
         return [(d.get_info(rs.camera_info.name), d.get_info(rs.camera_info.serial_number))
                 for d in rs.context().query_devices()]
 
-    def __init__(self, serial=None):
+    def __init__(self, serial=None, recording=None):
         super().__init__()
         self.img_size = config.get("dataset", {}).get("image_size", 512)
         if self.img_size not in (512, 640):
@@ -45,40 +45,50 @@ class RealSenseRGBDDataset(MonocularDataset):
         self.dataset_path = None
         self.save_results = False
         self.running = False
+        self.recorded_source = None
         self.last_number = None
         self.last_timestamp = None
         self.last_depth = None
         self.last_valid_fraction = 0.
         self.cfg = config.get("realsense", {})
-        devices = self.devices()
-        if not devices:
-            raise RuntimeError("No USB RealSense camera found. Connect D457 to this PC.")
-        if serial is None:
-            if len(devices) != 1:
-                raise RuntimeError("Multiple RealSense cameras found; select --serial.")
-            serial = devices[0][1]
-        if serial not in [s for _, s in devices]:
-            raise RuntimeError(f"RealSense serial {serial} is not connected.")
-        self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_device(serial)
-        w, h, fps = (int(self.cfg.get(k, v)) for k, v in [("width", 640), ("height", 480), ("fps", 30)])
-        cfg.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
-        cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
         try:
-            profile = self.pipeline.start(cfg)
-            self.running = True
+            if recording is not None:
+                from mast3r_slam.recorded_rgbd import RecordedRGBDSource
+                self.recorded_source = RecordedRGBDSource(recording)
+                profile = self.recorded_source.profile
+                self.dataset_path = self.recorded_source.path
+            else:
+                devices = self.devices()
+                if not devices:
+                    raise RuntimeError("No USB RealSense camera found. Connect D457 to this PC.")
+                if serial is None:
+                    if len(devices) != 1:
+                        raise RuntimeError("Multiple RealSense cameras found; select --serial.")
+                    serial = devices[0][1]
+                if serial not in [s for _, s in devices]:
+                    raise RuntimeError(f"RealSense serial {serial} is not connected.")
+                self.pipeline = rs.pipeline()
+                cfg = rs.config()
+                cfg.enable_device(serial)
+                w, h, fps = (int(self.cfg.get(k, v)) for k, v in [("width", 640), ("height", 480), ("fps", 30)])
+                cfg.enable_stream(rs.stream.color, w, h, rs.format.rgb8, fps)
+                cfg.enable_stream(rs.stream.depth, w, h, rs.format.z16, fps)
+                profile = self.pipeline.start(cfg)
+                self.running = True
             self.align = rs.align(rs.stream.color)
             device = profile.get_device()
             self.depth_scale = device.first_depth_sensor().get_depth_scale()
-            intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+            color_profile = profile.get_stream(rs.stream.color).as_video_stream_profile()
+            if profile.get_stream(rs.stream.depth).format() != rs.format.z16:
+                raise ValueError('RGB-D input requires Z16 depth')
+            intr = color_profile.get_intrinsics()
             self.camera_intrinsics = calibrated_intrinsics(intr, self.img_size)
             if self.camera_intrinsics is None:
                 raise RuntimeError("USB RGB-D input requires use_calib: true")
             self._pending = self._capture()
             self.raw_shape = self._pending[1].shape[:2]
-            print(f"USB RGB-D: {device.get_info(rs.camera_info.name)}; serial={serial}; "
-                  f"{w}x{h}@{fps}; processing={self._pending[2].shape[1]}x{self._pending[2].shape[0]}; "
+            print(f"RGB-D: {self.dataset_path or device.get_info(rs.camera_info.name)}; "
+                  f"{intr.width}x{intr.height}@{color_profile.fps()}; processing={self._pending[2].shape[1]}x{self._pending[2].shape[0]}; "
                   f"depth scale={self.depth_scale} m/unit", flush=True)
         except Exception:
             self.close()
@@ -88,7 +98,8 @@ class RealSenseRGBDDataset(MonocularDataset):
         deadline = time.monotonic()+self.cfg.get("timeout_ms", 5000)/1000.
         while time.monotonic() < deadline:
             timeout = max(1, int((deadline-time.monotonic())*1000))
-            frames = self.pipeline.wait_for_frames(timeout_ms=timeout)
+            frames = (self.recorded_source.next_frames(timeout) if self.recorded_source is not None
+                      else self.pipeline.wait_for_frames(timeout_ms=timeout))
             aligned = self.align.process(frames)
             color, depth = aligned.get_color_frame(), aligned.get_depth_frame()
             if not color or not depth:
@@ -101,9 +112,21 @@ class RealSenseRGBDDataset(MonocularDataset):
                 raise RuntimeError("Non-finite camera timestamp")
             # Small resets of the device clock do not interrupt live tracking.
             if self.last_timestamp is not None and timestamp <= self.last_timestamp:
+                if self.recorded_source is not None:
+                    raise ValueError('Recording timestamps are not increasing; split at the clock reset')
                 timestamp = self.last_timestamp+1./self.cfg.get("fps", 30)
             self.last_number, self.last_timestamp = number, timestamp
             rgb = np.asanyarray(color.get_data()).copy()
+            fmt = color.profile.format()
+            if fmt != rs.format.rgb8:
+                conversions = {rs.format.bgr8: cv2.COLOR_BGR2RGB,
+                               rs.format.rgba8: cv2.COLOR_RGBA2RGB,
+                               rs.format.bgra8: cv2.COLOR_BGRA2RGB,
+                               rs.format.yuyv: cv2.COLOR_YUV2RGB_YUY2,
+                               rs.format.uyvy: cv2.COLOR_YUV2RGB_UYVY}
+                if fmt not in conversions:
+                    raise ValueError(f'Unsupported color format: {fmt}')
+                rgb = cv2.cvtColor(rgb, conversions[fmt])
             z = np.asanyarray(depth.get_data()).astype(np.float32)*self.depth_scale
             intr = self.camera_intrinsics
             rgb = cv2.remap(rgb, intr.mapx, intr.mapy, cv2.INTER_LINEAR)
@@ -128,6 +151,8 @@ class RealSenseRGBDDataset(MonocularDataset):
         return self._pending[2].shape, self.raw_shape
 
     def close(self):
+        if self.recorded_source is not None:
+            self.recorded_source.close()
         if self.running:
             self.running = False
             self.pipeline.stop()

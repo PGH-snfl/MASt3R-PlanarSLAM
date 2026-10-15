@@ -1,4 +1,4 @@
-"""Live RGB-D + plane-constrained MASt3R with desktop or browser viewing."""
+"""Live/recorded RGB-D + plane-constrained MASt3R with map viewing."""
 import argparse
 import json
 import os
@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parent
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", default="config/d457_planar.yaml")
+    parser.add_argument("--config", help="Default: d457_planar.yaml live, recorded_planar.yaml for files")
+    parser.add_argument("--recording", type=Path, help="RealSense RGB-D recording; sequential offline processing to EOF")
     parser.add_argument("--serial")
     parser.add_argument("--camera-host", help="Camera host or SSH tunnel address; use network RGB-D instead of local USB")
     parser.add_argument("--camera-port", type=int, default=9877)
@@ -27,8 +28,8 @@ def main():
     parser.add_argument("--web-fps", type=float, default=2., help="Browser update limit; independent of SLAM FPS")
     parser.add_argument("--web-points", type=int, default=50000, help="Browser overview point budget, plus up to 4000 current points")
     parser.add_argument("--archive-mount", help="Require a mounted laptop archive folder; create a new session inside it")
-    parser.add_argument("--max-frames", type=int, default=0, help="0: run until the window closes or Ctrl+C")
-    parser.add_argument("--fps", type=float, default=5., help="Maximum processing rate; camera captures at its configured FPS")
+    parser.add_argument("--max-frames", type=int, default=0, help="0: run to recording EOF, or until live input is stopped")
+    parser.add_argument("--fps", type=float, default=None, help="Processing rate cap; default 5 live, 0 (uncapped) for recordings")
     parser.add_argument("--disable-planes", action="store_true", help="Disable plane pose constraints and plane depth denoising")
     parser.add_argument("--no-sdpa", action="store_true")
     parser.add_argument("--disable-plane-depth", action="store_true", help="Disable large-plane depth denoising; keep plane pose constraints")
@@ -41,6 +42,15 @@ def main():
     parser.add_argument("--viewer-fps", type=float, default=5., help="Maximum live data publication rate; latest frame only")
     args = parser.parse_args()
     import math
+    if args.recording is not None:
+        if args.camera_host or args.serial or args.list_devices or args.archive_mount:
+            parser.error('--recording cannot be combined with live-camera or remote-mount options')
+        args.recording = args.recording.expanduser().absolute()
+        if not args.recording.is_file():
+            parser.error(f'Recording not found: {args.recording}')
+    args.config = args.config or ('config/recorded_planar.yaml' if args.recording else 'config/d457_planar.yaml')
+    if args.fps is None:
+        args.fps = 0. if args.recording else 5.
     native_viz = not args.no_viz and not args.web_viz
     if not 1 <= args.web_port <= 65535 or not math.isfinite(args.web_fps) or args.web_fps <= 0 or args.web_points < 100:
         parser.error('Invalid web port, FPS or point budget')
@@ -55,8 +65,9 @@ def main():
         parser.error('--serial/--list-devices apply to local USB; select the camera on send_rgbd.py')
     if args.recent_keyframes is not None and args.recent_keyframes < 2:
         parser.error("--recent-keyframes must be at least 2")
-    if args.fps <= 0 or args.viewer_fps <= 0 or args.max_frames < 0:
-        parser.error("fps must be positive and max-frames must be nonnegative")
+    if (not math.isfinite(args.fps) or args.fps < 0 or (args.fps == 0 and not args.recording)
+            or not math.isfinite(args.viewer_fps) or args.viewer_fps <= 0 or args.max_frames < 0):
+        parser.error("fps must be positive (0 allowed for recordings); max-frames must be nonnegative")
     # Existing resource/checkpoint/config paths are relative to the project.
     os.chdir(ROOT)
     import torch
@@ -64,7 +75,9 @@ def main():
     import lietorch
     from mast3r_slam.config import load_config, config
     from mast3r_slam.realsense_rgbd import RealSenseRGBDDataset
+    from mast3r_slam.recorded_rgbd import RecordingEnded
     load_config(args.config)
+    config.setdefault('streaming', {})['offline'] = args.recording is not None
     if args.image_size is not None:
         config['dataset']['image_size'] = args.image_size
     image_size = config['dataset'].get('image_size', 512)
@@ -96,7 +109,9 @@ def main():
         config["depth_fusion"]["enabled"] = False
     torch.set_grad_enabled(False)
     torch.set_num_threads(4)
-    if args.camera_host:
+    if args.recording is not None:
+        dataset = RealSenseRGBDDataset(recording=args.recording)
+    elif args.camera_host:
         from mast3r_slam.network_rgbd import NetworkRGBDDataset
         dataset = NetworkRGBDDataset(args.camera_host, args.camera_port, args.camera_timeout)
     else:
@@ -109,6 +124,8 @@ def main():
                     print(f"RGB-D {i}: t={timestamp:.3f}, RGB={rgb.shape}, depth={dataset.last_depth.shape}, valid={dataset.last_valid_fraction:.1%}")
                     if args.camera_host:
                         print(f"Network: {dataset.last_network_stats}")
+        except RecordingEnded:
+            print('Recording finished during input check.', flush=True)
         finally:
             dataset.close()
         return
@@ -160,6 +177,10 @@ def main():
         metrics_file = (Path(archive_dir)/'performance.jsonl').open('w', buffering=1)
         import yaml
         (Path(archive_dir)/'config.yaml').write_text(yaml.safe_dump(config))
+        (Path(archive_dir)/'input.json').write_text(json.dumps(dict(
+            recording=str(args.recording) if args.recording else None,
+            offline=args.recording is not None, fps_limit=args.fps,
+            max_frames=args.max_frames), indent=2))
         view_keyframes = None
         if native_viz:
             view_keyframes = SharedKeyframes(manager, h, w, buffer=recent, device='cpu')
@@ -176,8 +197,11 @@ def main():
         temporal_depth = TemporalPlaneDepth(config.get('temporal_plane_depth', {}))
         surface_depth = TemporalSurfaceDepth(config.get('temporal_surface', {}))
         depth_cap = config.get('plane_depth', {}).get('max_correction_m', .01)
-        # Drop the startup frame: loading weights may have taken several seconds.
-        dataset._pending = None
+        # Live input starts fresh after model loading; files retain the first frame.
+        if args.recording is None:
+            dataset._pending = None
+        else:
+            print('Offline: sequential RGB-D, blocking retrieval/optimization, no wall-clock frame skipping.', flush=True)
         last_pose = lietorch.Sim3.Identity(1, device=device)
         print(f"Ready: recent GPU keyframes={recent}, candidate cache={keyframes.cache_limit}. "
               f"Keyframes/map archive: {archive_dir} (continuous video is not recorded)", flush=True)
@@ -204,7 +228,11 @@ def main():
             timer = StageTimer(args.profile)
             wait_before = disk_map.wait_ms
             with timer.measure('camera'):
-                timestamp, image = dataset[processed]
+                try:
+                    timestamp, image = dataset[processed]
+                except RecordingEnded:
+                    print('Recording finished. Finalizing map...', flush=True)
+                    break
             if not config["depth_fusion"]["enabled"] and dataset.last_valid_fraction < .01:
                 raise RuntimeError("Less than 1% valid depth; check D457 depth stream and viewing distance")
             frame = create_frame(processed, image, last_pose, img_size=image_size, device=device)
@@ -271,7 +299,10 @@ def main():
             relative = keyframes[reference].T_WC.inv()*frame.T_WC
             with timer.measure('backend_tick'):
                 recovered = backend.tick(frame, relocating=(mode == Mode.RELOC))
-                backend.global_graph.submit()
+                if args.recording is not None:
+                    backend.global_graph.settle()
+                else:
+                    backend.global_graph.submit()
             if recovered:
                 states.set_mode(Mode.TRACKING)
                 tracker.reset_idx_f2k()
@@ -340,7 +371,7 @@ def main():
             timer.fence()
             selection = getattr(tracker, 'selection_stats', {}) if mode == Mode.TRACKING else {}
             metrics = dict(frame=frame.frame_id, mode=states.get_mode().name, cuda_synchronized=args.profile,
-                           image_shape=[h, w], cuda_allocated_mb=torch.cuda.memory_allocated()/1024**2,
+                           timestamp=float(timestamp), image_shape=[h, w], cuda_allocated_mb=torch.cuda.memory_allocated()/1024**2,
                            cuda_peak_allocated_mb=torch.cuda.max_memory_allocated()/1024**2,
                            cuda_reserved_mb=torch.cuda.memory_reserved()/1024**2,
                            step_ms=1000*(time.monotonic()-started), stages_ms=timer.times,
@@ -353,7 +384,8 @@ def main():
             if processed % 10 == 0 or args.profile:
                 print('timing(ms): '+ ' '.join(f'{k}={v:.1f}' for k, v in timer.times.items())
                       + f' pose_points={selection} map_wait={metrics["map_wait_ms"]:.1f}', flush=True)
-            time.sleep(max(0., 1./args.fps-(time.monotonic()-started)))
+            if args.fps > 0:
+                time.sleep(max(0., 1./args.fps-(time.monotonic()-started)))
     except KeyboardInterrupt:
         print("Stopped by user")
     finally:
@@ -375,6 +407,8 @@ def main():
         try:
             try:
                 if disk_map is not None:
+                    if args.recording is not None and backend is not None:
+                        backend.global_graph.settle()
                     if keyframes is not None and len(keyframes):
                         disk_map.sync_poses(keyframes)
                     disk_map.close()

@@ -18,7 +18,10 @@ from mast3r_slam.streaming_backend import StreamingBackend
 
 
 class Camera:
-    def __init__(self, serial=None):
+    def __init__(self, serial=None, recording=None):
+        self.recording = recording
+        self._pending = object()
+        self.first = self._pending
         self.camera_intrinsics = SimpleNamespace(K_frame=np.array([[400., 0, 256.], [0, 400., 192.], [0, 0, 1.]], dtype=np.float32))
         self.last_depth = (2.+np.random.default_rng(5).normal(0, .005, (384, 512))).astype(np.float32)
         self.base_depth = self.last_depth.copy()
@@ -26,6 +29,12 @@ class Camera:
     def get_img_shape(self):
         return (384, 512), (384, 512)
     def __getitem__(self, idx):
+        if self.recording is not None:
+            from mast3r_slam.recorded_rgbd import RecordingEnded
+            if idx == 0:
+                assert self._pending is self.first, 'First recording frame was dropped'
+            if idx == 16:
+                raise RecordingEnded('EOF')
         self.last_depth = self.base_depth+(0 if idx == 0 else .004*(-1)**idx)
         return idx*.1, np.full((480, 640, 3), .4, np.float32)
     def close(self):
@@ -62,10 +71,16 @@ class Database:
 
 def main():
     web_mode = '--web' in sys.argv
+    recording_mode = '--recording' in sys.argv
     with tempfile.TemporaryDirectory(prefix='mast3r-runner-test-') as temp:
         archive = Path(temp)/'session'
         sys.argv = ['run_d457.py', '--no-viz', '--max-frames', '16', '--fps', '30',
                     '--archive-dir', str(archive), '--recent-keyframes', '3', '--image-size', '512']
+        if recording_mode:
+            fixture = Path(temp)/'fixture.db3'
+            fixture.touch()
+            sys.argv += ['--recording', str(fixture)]
+            sys.argv[sys.argv.index('--max-frames')+1] = '0'
         if web_mode:
             sys.argv.remove('--no-viz')
             sys.argv += ['--web-viz', '--web-port', '18081', '--web-points', '1000']

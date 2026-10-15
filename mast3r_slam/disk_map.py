@@ -207,8 +207,8 @@ class DiskMapReader:
             self.cache.popitem(last=False)
         return self.cache[fid]
 
-    def snapshot(self, eye, threshold=1.5, view_projection=None):
-        self.refresh()
+    def visible_candidates(self, eye, view_projection=None):
+        """Rank visible chunks using the latest pose table, near ones first."""
         candidates = []
         matrices = {}
         planes = None
@@ -228,8 +228,17 @@ class DiskMapReader:
             distance = max(0., np.linalg.norm(center-eye)-radius)
             candidates.append((distance, entry['kind'] != 'keyframe', -entry['frame_id'], entry))
         candidates.sort(key=lambda row: row[:3])
+        return candidates, matrices
+
+    def snapshot(self, eye, threshold=1.5, view_projection=None, *,
+                 nonkeyframes_only=False, exclude_frame_ids=()):
+        self.refresh()
+        candidates, matrices = self.visible_candidates(eye, view_projection)
+        excluded = set(exclude_frame_ids)
         selected, count = [], 0
         for _, _, _, entry in candidates:
+            if entry['frame_id'] in excluded or (nonkeyframes_only and entry['kind'] == 'keyframe'):
+                continue
             if len(selected) >= self.chunk_limit:
                 break
             if count+entry['points'] <= self.point_budget:
@@ -252,7 +261,7 @@ class DiskMapReader:
         # It is rebuilt from local previews and current poses, never frozen in
         # stale world coordinates when a loop changes the anchors.
         overview_budget = int(self.cfg.get('view_overview_points', 100000))
-        remaining = [e for e in self.entries if e['frame_id'] not in ids and e['frame_id'] in matrices]
+        remaining = [e for e in self.entries if e['frame_id'] not in ids | excluded and e['frame_id'] in matrices]
         overview = []
         total = sum(len(e['preview']) for e in remaining)
         # Global deterministic subsampling, with an exact bound on output.

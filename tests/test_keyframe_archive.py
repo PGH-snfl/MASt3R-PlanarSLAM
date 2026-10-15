@@ -179,6 +179,31 @@ class ArchiveTests(unittest.TestCase):
         finally:
             backend.close()
 
+    def test_offline_checks_all_candidates_before_next_frame_with_bounded_cache(self):
+        config['streaming'].update(offline=True, search_every=1)
+        config['global_pose_graph']['enabled'] = False
+        backend = StreamingBackend(None, self.store, torch.eye(3), FakeDatabase(), 'cpu')
+        checked = []
+        def reject(ii, jj, *args, **kwargs):
+            if kwargs.get('is_reloc'):
+                checked.append((ii[0], jj[0]))
+            return False
+        try:
+            with patch.object(backend.graph, 'add_factors', side_effect=reject):
+                for idx in range(10):
+                    self.assertTrue(backend.can_add())
+                    current = frame(idx)
+                    backend.new_keyframe(self.store.append(current))
+                    backend.tick(current)
+                    self.assertFalse(backend.search.pending)
+                    self.assertFalse(backend.candidates)
+                    self.assertLessEqual(len(self.store.resident_ids), 5)
+            # Three disk candidates must all be checked despite a cache of two.
+            self.assertEqual([i for i, j in checked if j == 9], [0, 1, 2])
+            self.assertEqual(backend.search.ids, list(range(10)))
+        finally:
+            backend.close()
+
     def test_relocalization_temporary_frame_does_not_evict_window(self):
         for i in range(3):
             self.store.append(frame(i))

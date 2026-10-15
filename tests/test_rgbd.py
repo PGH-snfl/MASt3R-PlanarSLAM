@@ -93,6 +93,7 @@ class RGBDTests(unittest.TestCase):
 
     def test_capture_converts_units_and_accepts_clock_reset(self):
         ds = RealSenseRGBDDataset.__new__(RealSenseRGBDDataset)
+        ds.recorded_source = None
         ds.cfg = {"timeout_ms": 1000, "fps": 30}
         ds.depth_scale = .001
         ds.last_number = (1, 1)
@@ -103,6 +104,7 @@ class RGBDTests(unittest.TestCase):
         sample = MagicMock()
         ds.align.process.return_value = sample
         color, depth = MagicMock(), MagicMock()
+        color.profile.format.return_value = rs.format.rgb8
         sample.get_color_frame.return_value = color
         sample.get_depth_frame.return_value = depth
         color.get_frame_number.return_value = 2
@@ -116,6 +118,10 @@ class RGBDTests(unittest.TestCase):
         self.assertGreater(ts, 10.)
         np.testing.assert_allclose(z, 1.5)
         self.assertEqual(rgb.shape, (480, 640, 3))
+        ds.recorded_source = MagicMock()
+        ds.last_number = None
+        with self.assertRaisesRegex(ValueError, 'timestamps'):
+            ds._capture()
 
 
 if __name__ == '__main__':
